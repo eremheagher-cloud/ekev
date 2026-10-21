@@ -1,0 +1,297 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rdp-state
+  cancel-in-progress: false
+
+jobs:
+  secure-rdp:
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show Windows and Hardware Information
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host '========== WINDOWS AND HARDWARE =========='
+
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor
+
+          $os | Select-Object Caption, Version, BuildNumber,
+            OSArchitecture | Format-List
+
+          $cpu | Select-Object Name, Architecture,
+            NumberOfCores, NumberOfLogicalProcessors | Format-List
+
+          $total = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+          $free = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+
+          Write-Host "RAM total: $total GB"
+          Write-Host "RAM disponivel: $free GB"
+          Write-Host "RAM em uso: $([math]::Round($total - $free, 2)) GB"
+          Write-Host "Arquitetura: $($os.OSArchitecture)"
+
+          Write-Host '=========================================='
+
+      - name: Create Windows Account Rafael
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $username = 'Rafael'
+          $plainPassword = 'yysst'
+
+          $securePassword = ConvertTo-SecureString `
+            $plainPassword -AsPlainText -Force
+
+          $existingUser = Get-LocalUser -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingUser) {
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -AccountNeverExpires | Out-Null
+          }
+          else {
+            Set-LocalUser `
+              -Name $username `
+              -Password $securePassword
+          }
+
+          $userSid = (Get-LocalUser -Name $username).SID.Value
+
+          foreach ($group in @(
+            'Administrators',
+            'Remote Desktop Users'
+          )) {
+            $members = Get-LocalGroupMember -Group $group `
+              -ErrorAction SilentlyContinue
+
+            if (-not ($members | Where-Object {
+              $_.SID.Value -eq $userSid
+            })) {
+              Add-LocalGroupMember `
+                -Group $group `
+                -Member $username
+            }
+          }
+
+          Write-Host 'Usuario Windows: Rafael'
+          Write-Host 'Senha Windows: configurada'
+          Write-Host 'Administrador: Sim'
+          Write-Host 'Acesso RDP: configurado'
+
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0 -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1 -Force
+
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName 'RDP-Tailscale' `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Profile Any
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host 'RDP habilitado.'
+
+      - name: Prepare Windows Services for Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $requiredServices = @(
+            'Dnscache',
+            'iphlpsvc',
+            'netprofm',
+            'WinHttpAutoProxySvc'
+          )
+
+          foreach ($serviceName in $requiredServices) {
+            $service = Get-Service -Name $serviceName `
+              -ErrorAction SilentlyContinue
+
+            if ($null -eq $service) {
+              Write-Host "Servico opcional ausente: $serviceName"
+              continue
+            }
+
+            if ($service.StartType -eq 'Disabled') {
+              Set-Service -Name $serviceName -StartupType Manual
+            }
+
+            if ((Get-Service -Name $serviceName).Status -ne 'Running') {
+              try {
+                Start-Service -Name $serviceName -ErrorAction Stop
+              }
+              catch {
+                Write-Warning "Servico $($serviceName): $_"
+              }
+            }
+          }
+
+      - name: Install Tailscale ARM64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          $installerPath = Join-Path $env:TEMP 'tailscale-arm64.msi'
+          $logPath = Join-Path $env:TEMP 'tailscale-install.log'
+          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          $tsUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-arm64.msi'
+
+          if (-not (Test-Path $tsExe)) {
+            Write-Host 'Baixando instalador oficial ARM64...'
+
+            Invoke-WebRequest `
+              -Uri $tsUrl `
+              -OutFile $installerPath `
+              -UseBasicParsing
+
+            if ((Get-Item $installerPath).Length -lt 1000000) {
+              throw 'O instalador parece incompleto.'
+            }
+
+            $arguments = @(
+              '/i',
+              "`"$installerPath`"",
+              '/qn',
+              '/norestart',
+              '/L*V',
+              "`"$logPath`""
+            )
+
+            $process = Start-Process `
+              -FilePath "$env:SystemRoot\System32\msiexec.exe" `
+              -ArgumentList $arguments `
+              -Wait `
+              -PassThru
+
+            if ($process.ExitCode -notin @(0, 3010)) {
+              if (Test-Path $logPath) {
+                Get-Content $logPath -Tail 50
+              }
+
+              throw "Falha na instalacao: $($process.ExitCode)"
+            }
+          }
+
+          $deadline = (Get-Date).AddSeconds(45)
+
+          while (-not (Test-Path $tsExe) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not (Test-Path $tsExe)) {
+            throw "Tailscale nao encontrado: $tsExe"
+          }
+
+          & $tsExe version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Falha ao executar Tailscale.'
+          }
+
+          Write-Host 'Instalacao validada.'
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          version: latest
+
+      - name: Verify Tailscale and RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+
+          if (-not (Test-Path $tsExe)) {
+            throw 'Tailscale nao foi encontrado.'
+          }
+
+          Write-Host '========== TAILSCALE =========='
+
+          $status = & $tsExe status --json
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Falha ao consultar o estado do Tailscale.'
+          }
+
+          $data = $status | ConvertFrom-Json
+
+          if ($data.BackendState -ne 'Running') {
+            throw "Tailscale desconectado: $($data.BackendState)"
+          }
+
+          $ipOutput = & $tsExe ip -4
+
+          if ($LASTEXITCODE -ne 0 -or -not $ipOutput) {
+            throw 'Nao foi possivel obter o IP Tailscale.'
+          }
+
+          $rdp = Get-ItemProperty `
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+
+          if ($rdp.fDenyTSConnections -ne 0) {
+            throw 'RDP nao esta habilitado.'
+          }
+
+          Write-Host 'Conta Windows: Rafael'
+          Write-Host "IP Tailscale: $($ipOutput -join ', ')"
+          Write-Host "Estado Tailscale: $($data.BackendState)"
+          Write-Host 'RDP habilitado: Sim'
+          Write-Host '================================'
+
+      - name: Keep RDP Session Alive
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host 'Mantendo o job ativo ate o limite de 360 minutos.'
+
+          while ($true) {
+            Start-Sleep -Seconds 60
+
+            $service = Get-Service -Name TermService
+
+            if ($service.Status -ne 'Running') {
+              Start-Service -Name TermService
+            }
+
+            Write-Host "Verificacao: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          }
